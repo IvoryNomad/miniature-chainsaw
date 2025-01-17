@@ -1,0 +1,159 @@
+#!/bin/bash
+
+IF=$1
+STATUS=$2
+LOGFILE="/var/log/nm-dns-update.log"
+
+log() {
+    echo "$(date): $*" >> "$LOGFILE"
+    logger -t nm-dns-update "$*"
+}
+
+log_debug() {
+    echo "$(date): DEBUG: $*" >> "$LOGFILE"
+    logger -t nm-dns-update "DEBUG: $*"
+}
+
+# Function to check if zone is managed by IPA
+check_ipa_zone() {
+    local zone=$1
+    local server=$2
+    dig +short @"$server" SOA "$zone" +timeout=1 > /dev/null 2>&1
+}
+
+# Check if we can reach a DNS server
+check_dns_server() {
+    local server=$1
+    local domain=$2
+    # Try to resolve the server itself as a basic connectivity test
+    if dig +short @"$server" "$server" +timeout=1 > /dev/null 2>&1; then
+        # Test if we can do a simple query against IPA domain
+        if dig +short @"$server" SOA "$domain" +timeout=1 > /dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Get the reverse zone from an IPv4 address
+get_reverse_zone_v4() {
+    local ip=$1
+    echo "$ip" | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}'
+}
+
+# Get the full PTR record name from an IPv4 address
+get_ptr_name_v4() {
+    local ip=$1
+    echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1".in-addr.arpa"}'
+}
+
+# Only run on up/dhcp4-change events
+if [ "$STATUS" != "up" ] && [ "$STATUS" != "dhcp4-change" ]; then
+    exit 0
+fi
+
+# Get current IPv4 address
+IPV4=$(ip -4 addr show dev "$IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+if [ -z "$IPV4" ]; then
+    log "Failed to get IPv4 address for interface $IF"
+    exit 1
+fi
+
+# Get local hostname and validate FQDN
+HOSTNAME=$(hostname -f)
+if [[ "$HOSTNAME" != *.* ]]; then
+    log "Error: hostname -f did not return FQDN"
+    exit 1
+fi
+
+# Extract and validate domain
+DNS_DOMAIN=${HOSTNAME#*.}
+if [[ -z "$DNS_DOMAIN" ]] || [[ "$DNS_DOMAIN" == "$HOSTNAME" ]]; then
+    log "Error: Could not extract domain from hostname $HOSTNAME"
+    exit 1
+fi
+
+# Get list of DNS servers
+DNS_SERVERS=$(ipa config-show | grep 'IPA DNS servers' | cut -d ':' -f2 | tr -d ' ' | tr ',' ' ')
+if [ -z "$DNS_SERVERS" ]; then
+    log "Failed to get IPA DNS servers list"
+    exit 1
+fi
+
+# Try each DNS server until we find one that's available
+DNS_SERVER=""
+for server in $DNS_SERVERS; do
+    log_debug "Checking DNS server $server"
+    if check_dns_server "$server" "$DNS_DOMAIN"; then
+        DNS_SERVER=$server
+        log_debug "Selected working DNS server: $DNS_SERVER"
+        break
+    else
+        log_debug "DNS server $server not reachable"
+    fi
+done
+
+if [ -z "$DNS_SERVER" ]; then
+    log "No reachable IPA DNS servers found - likely offline or offsite"
+    exit 0
+fi
+
+# Get Kerberos ticket and capture output
+KINIT_OUT=$(kinit -k 2>&1)
+if [ $? -ne 0 ]; then
+    log "Failed to get Kerberos ticket: $KINIT_OUT"
+    exit 1
+fi
+log_debug "Kerberos ticket obtained"
+
+# Handle forward and reverse DNS updates
+REV4=$(get_ptr_name_v4 "$IPV4")
+ZONE4=$(get_reverse_zone_v4 "$IPV4")
+
+log "Updating A record for $HOSTNAME to $IPV4"
+log_debug "Reverse DNS zone: $ZONE4"
+log_debug "Reverse PTR record: $REV4"
+
+# First handle the A record update
+NSUPDATE_INPUT="server $DNS_SERVER
+update delete $HOSTNAME A
+update add $HOSTNAME 300 A $IPV4
+send"
+
+log_debug "A record nsupdate input: $NSUPDATE_INPUT"
+
+NSUPDATE_OUTPUT=$(echo "$NSUPDATE_INPUT" | nsupdate -g -d 2>&1)
+NSUPDATE_STATUS=$?
+
+if [ $NSUPDATE_STATUS -eq 0 ]; then
+    log "A record update successful"
+else
+    log "A record update failed with status $NSUPDATE_STATUS"
+    log_debug "nsupdate output: $NSUPDATE_OUTPUT"
+    exit 1
+fi
+
+# Then handle PTR record if zone is managed
+if check_ipa_zone "$ZONE4" "$DNS_SERVER"; then
+    log_debug "Found IPA-managed reverse zone $ZONE4"
+    log "Updating PTR record $REV4"
+    
+    NSUPDATE_INPUT="server $DNS_SERVER
+update delete $REV4 PTR
+update add $REV4 300 PTR $HOSTNAME
+send"
+
+    log_debug "PTR record nsupdate input: $NSUPDATE_INPUT"
+
+    NSUPDATE_OUTPUT=$(echo "$NSUPDATE_INPUT" | nsupdate -g -d 2>&1)
+    NSUPDATE_STATUS=$?
+
+
+if [ $NSUPDATE_STATUS -eq 0 ]; then
+    log "DNS update successful"
+else
+    log "DNS update failed with status $NSUPDATE_STATUS"
+    log_debug "nsupdate output: $NSUPDATE_OUTPUT"
+fi
+
+# vim: set filetype=sh :
