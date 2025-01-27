@@ -147,7 +147,7 @@ send"
 
     NSUPDATE_OUTPUT=$(echo "$NSUPDATE_INPUT" | nsupdate -g -d 2>&1)
     NSUPDATE_STATUS=$?
-
+fi
 
 if [ $NSUPDATE_STATUS -eq 0 ]; then
     log "DNS update successful"
